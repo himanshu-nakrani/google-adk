@@ -432,3 +432,121 @@
   2. Stateless API Scaling: Your agent runners are completely decoupled from database connections. You can scale your runner services up and down (e.g. on serverless stacks) without any state loss or routing sync headaches.
   3. Cross-Session Integration: The separate  adk_users  table serves as an out-of-the-box persistent user profile store. You can easily query this table from other legacy applications (like an enterprise CRM dashboard) to
   synchronize premium tiers, preferences, or audit trails without affecting active agent sessions.
+
+────────────────────────────────────────────────────────────
+> how is state passes in loop and parallel
+
+▸ Thought for 7s, 1.1k tokens
+  Analyzing the Request
+  Here is the detailed breakdown of how state is passed, isolated, and merged under the hood in both  LoopAgent  and  ParallelAgent  inside Google ADK.
+  ──────
+  ### 1. State Passing in  LoopAgent  (Sequential/Iterative Refinement)
+
+  In a  LoopAgent , sub-agents execute sequentially in a repeated cycle.
+
+  #### The Mechanics:
+
+  • Shared Invocation Context: All sub-agents inside a loop run within the same shared  InvocationContext  and interact with a single  session.state  blackboard.
+  • Step-by-Step Commit:
+      1. When Sub-Agent 1 (e.g., Writer) completes, its output is committed to  session.state["draft"]  (via its  output_key  or manual delta).
+      2. Sub-Agent 2 (e.g., Critic) starts immediately afterward. Because it runs next, its template prompt successfully resolves the newly written value ( {draft} ).
+      3. A loop-checker agent (e.g., QualityChecker) runs last in the sequence to check the quality score in state. If it decides to repeat, it increments the iteration counter in state.
+  • Cross-Iteration State Passing: When the loop restarts (Iteration 2), Sub-Agent 1 is re-executed. Its prompt resolves template keys (like  Current draft: {draft}\nFeedback: {critic_feedback} ) by pulling the values written
+  during the previous iteration.
+
+  #### State Flow Visual:
+
+    Initial Session State: {draft: "", critic_feedback: ""}
+      ↓
+    [Iteration 1]
+      ├─ Writer: Reads {draft=""}
+      │          → Writes "Draft v1" to session.state["draft"]
+      ├─ Critic: Reads {draft="Draft v1"}
+      │          → Writes "Needs X" to session.state["critic_feedback"]
+      └─ Checker: Increments iteration = 1. Decides to repeat.
+      ↓
+    [Iteration 2]
+      ├─ Writer: Reads {draft="Draft v1", critic_feedback="Needs X"}
+      │          → Writes "Draft v2" to session.state["draft"]
+      ├─ Critic: Reads {draft="Draft v2"}
+      │          → Writes "Looks great!" to session.state["critic_feedback"]
+      └─ Checker: Score >= 8. Yields escalate=True to break loop.
+  ──────
+  ### 2. State Passing in  ParallelAgent  (Concurrent Fan-Out/Fan-In)
+
+  In a  ParallelAgent , sub-agents execute concurrently (multitasking via an asynchronous gather loop).
+
+  #### The Mechanics:
+
+  • Context Branching: If all parallel branches read and wrote to the same memory dictionary at the same time, they would corrupt each other's intermediate state. To prevent this, ADK creates a separate branch context for each
+  sub-agent when the fan-out begins.
+  • Snapshot Read: Each branch reads from a snapshot of the starting  session.state  at the moment of fan-out.
+  • The Unique Key Requirement (Fan-In):
+      • As each concurrent branch completes its task, it yields its own state updates.
+      • ADK intercepts these updates and merges them back into the parent  session.state  (fan-in).
+      • CRITICAL RULE: Because the branches run concurrently, they must write to unique output keys (e.g.,  climate_result ,  ai_result ,  space_result ).
+      • Why? If Branch A and Branch B both write to a shared key named  result , the final value stored in the database depends entirely on which branch finishes last (a race condition).
+  • Downstream Sequencing: Because parallel branches cannot read each other's outputs while they are running, any merging or comparison must happen after the  ParallelAgent  completes—typically by placing a sequential "Merger"
+  agent after the parallel step.
+
+  #### State Flow Visual:
+
+                      Starting Session State: {query: "Future Tech"}
+                                              ↓
+                            ─── Parallel Fan-Out (Branching) ───
+                            /                 |                  \
+              [Branch A]                [Branch B]                [Branch C]
+              Reads: {query}            Reads: {query}            Reads: {query}
+              Writes: climate_result    Writes: ai_result         Writes: space_result
+                            \                 |                  /
+                            ─── Parallel Fan-In (Merging) ───
+                                              ↓
+        Resulting Session State: {
+            climate_result: "State of climate...",
+            ai_result: "Advances in AI...",
+            space_result: "Mars missions..."
+        }
+                                              ↓
+        Sequential Merger Step: Reads all three keys and compiles them into a unified paragraph.
+
+────────────────────────────────────────────────────────────
+> can each agent read each others state in parallel?
+
+▸ Thought for 5s, 493 tokens
+  Assessing Parallelism Capability
+  NO, they cannot.
+
+  In a standard  ParallelAgent  execution, branches are completely isolated from one another while they are running. An agent running in Branch A cannot read the intermediate or final state being written by an agent running in
+  Branch B at the same time.
+  ──────
+  ### Why Inter-Branch State Reading is Disabled
+
+  There are three major architectural reasons for this design in Google ADK:
+
+  1. Concurrency Isolation (Race Condition Prevention):
+  If Branch A were allowed to read Branch B's state in real-time, the result of Branch A would depend entirely on sub-millisecond execution timing (e.g., did B complete its LLM call before A reached its prompt template?). This
+  would make the multi-agent system non-deterministic and extremely difficult to debug in production.
+  2. State Snapshotting:
+  When the  ParallelAgent  fans out, ADK captures a static snapshot of the parent session state and hands a copy of that snapshot to each branch. The branches only see the state that existed before the parallel block started.
+  3. Database Commit Boundaries:
+  In production databases (like Firestore or PostgreSQL), state is only committed at the end of a transaction (when a branch completes and returns its final event). Intermediate or half-written states inside an active branch are
+  never flushed to the shared database until that specific branch finishes.
+  ──────
+  ### What to Do If Agents Need to Read Each Other's Outputs
+
+  Depending on your use case, there are two standard patterns to handle this:
+
+  #### Pattern 1: Sequential Chaining (Dependency Flow)
+
+  If Agent B's execution depends on the output of Agent A, they should not run in parallel. Place them in a sequential pipeline instead:
+
+    [Agent A] ──writes A_result──> [Agent B] (Reads {A_result})
+
+  #### Pattern 2: Collaborative Loops (Round-Robin Negotiation)
+
+  If you need two agents to "collaborate" or "negotiate" (continually reacting to each other's intermediate outputs), place them in a  LoopAgent  and run them in sequential rounds:
+
+  • Round 1: Agent A generates draft and saves to  draft .
+  • Round 2: Agent B reads  draft , writes feedback to  feedback .
+  • Round 3: Agent A reads  draft  +  feedback , refines the draft and overwrites  draft .
+  • Repeat until done.
